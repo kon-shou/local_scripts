@@ -11,8 +11,8 @@ for d in $REPOS; do
   echo "#### $d"
 
   # jq の select 条件を動的に生成
-  if [ -n "$EXCLUDE_AUTHOR" ]; then
-    JQ_FILTER=".[] | select(.author.login != \"$EXCLUDE_AUTHOR\") | [.number, .title] | join(\"@@@@@@@@@@@@\")"
+  if [ -n "$AUTHOR" ]; then
+    JQ_FILTER=".[] | select(.author.login != \"$AUTHOR\") | [.number, .title] | join(\"@@@@@@@@@@@@\")"
   else
     JQ_FILTER=".[] | [.number, .title] | join(\"@@@@@@@@@@@@\")"
   fi
