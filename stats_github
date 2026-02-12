@@ -1,0 +1,183 @@
+#!/bin/bash
+
+# ==========================================
+# 【設定】デフォルト値（環境変数で上書き可能）
+# ==========================================
+REPOS="${REPOS}"
+LOCAL_ROOT="${REPOS_BASE_PATH}"
+MONTHS_AGO="${STATS_GITHUB_MONTHS_AGO:-12}"
+GIT_AUTHOR="${STATS_GITHUB_AUTHOR_PATTERN}"
+EXCLUDE_PATTERN="${REPO_AUTHORS_EXCLUDE_PATTERN}"
+MAX_LINES_LIMIT="${REPO_AUTHORS_MAX_LINES:-50000}"
+MASTER_REPOS="${STATS_GITHUB_MASTER_REPOS}"
+# ==========================================
+
+# SINCE_DATE が設定されていれば優先、なければ MONTHS_AGO から計算
+if [ -n "${STATS_GITHUB_SINCE_DATE}" ]; then
+    SINCE_DATE="${STATS_GITHUB_SINCE_DATE}"
+else
+    if date -v -${MONTHS_AGO}m > /dev/null 2>&1; then
+        # macOS
+        SINCE_DATE=$(date -v -${MONTHS_AGO}m +%Y-%m-%d)
+    else
+        # Linux
+        SINCE_DATE=$(date -d "${MONTHS_AGO} months ago" +%Y-%m-%d)
+    fi
+fi
+
+ALL_LOGS=$(mktemp)
+
+echo "📊 貢献シェア率集計 (${SINCE_DATE} 〜 本日)"
+echo "👤 User: \"$GIT_AUTHOR\""
+echo "📡 Action: 最新の origin/master(main) を取得して集計"
+echo "⚠️  1ファイル ${MAX_LINES_LIMIT}行以上の変更は除外"
+echo "-----------------------------------------------------------------------------------------"
+printf "%-20s | %-7s | %10s | %10s | %7s | %s\n" "Repository" "Branch" "My Lines" "Total Lines" "Share" "Note"
+echo "-----------------------------------------------------------------------------------------"
+
+grand_my_lines=0
+grand_total_lines=0
+
+for repo in $REPOS; do
+    repo_path="${LOCAL_ROOT}/${repo}"
+
+    # ブランチ判定（環境変数化）
+    if echo " ${MASTER_REPOS} " | grep -q " ${repo} "; then
+        TARGET_BRANCH="master"
+    else
+        TARGET_BRANCH="main"
+    fi
+
+    # 集計対象をリモート追跡ブランチにする (origin/master)
+    TARGET_REF="origin/$TARGET_BRANCH"
+
+    if [ -d "$repo_path/.git" ]; then
+        # ---------------------------------------------------------
+        # 0. 最新情報を取得 (Fetch)
+        # ---------------------------------------------------------
+        git -C "$repo_path" fetch origin "$TARGET_BRANCH" >/dev/null 2>&1
+
+        # 指定ブランチ(リモート)が存在するかチェック
+        if ! git -C "$repo_path" rev-parse --verify "$TARGET_REF" >/dev/null 2>&1; then
+            printf "%-20s | %-7s |      -     |      -     |    -   | (Remote branch not found)\n" "${repo:0:20}" "$TARGET_BRANCH"
+            continue
+        fi
+
+        # ---------------------------------------------------------
+        # 1. 自分の行数を計算
+        # ---------------------------------------------------------
+
+        # ログ保存 (拡張子集計用)
+        git -C "$repo_path" log "$TARGET_REF" --author="$GIT_AUTHOR" -i --since="$SINCE_DATE" --no-merges --numstat --format="" --no-renames \
+            | grep -vE "$EXCLUDE_PATTERN" \
+            | awk -v limit="$MAX_LINES_LIMIT" '{ if ($1 ~ /^[0-9]+$/ && ($1+$2) <= limit) print $0 }' \
+            >> "$ALL_LOGS"
+
+        # 数値計算 & 除外ファイルチェック
+        output_me=$(git -C "$repo_path" log "$TARGET_REF" --author="$GIT_AUTHOR" -i --since="$SINCE_DATE" --no-merges --numstat --format="" --no-renames \
+            | grep -vE "$EXCLUDE_PATTERN" \
+            | awk -v limit="$MAX_LINES_LIMIT" '
+                BEGIN {sum=0; skip=0; files=""}
+                {
+                    if ($1 !~ /^[0-9]+$/) next;
+                    lines = $1 + $2;
+
+                    if (lines > limit) {
+                        skip++;
+                        entry = $3 ": " lines;
+                        if (files == "") files = entry;
+                        else files = files ", " entry;
+                    }
+                    else {
+                        sum += lines;
+                    }
+                }
+                END {printf "%d\t%d\t%s", sum, skip, files}'
+        )
+
+        IFS=$'\t' read my_lines my_skip my_ignored_files <<< "$output_me"
+        unset IFS
+
+        # ---------------------------------------------------------
+        # 2. 全体の行数を計算
+        # ---------------------------------------------------------
+        output_total=$(git -C "$repo_path" log "$TARGET_REF" --since="$SINCE_DATE" --no-merges --numstat --format="" --no-renames \
+            | grep -vE "$EXCLUDE_PATTERN" \
+            | awk -v limit="$MAX_LINES_LIMIT" '
+                BEGIN {sum=0}
+                {
+                    if ($1 !~ /^[0-9]+$/) next;
+                    if (($1+$2) <= limit) sum+=$1+$2
+                }
+                END {printf "%d", sum}'
+        )
+        total_lines="$output_total"
+
+        # 3. シェア率 & Note表示
+        if [ "$total_lines" -gt 0 ]; then
+            share=$(awk "BEGIN {printf \"%.1f\", ($my_lines / $total_lines) * 100}")
+        else
+            share="0.0"
+        fi
+
+        note=""
+        if [ "$my_skip" -gt 0 ]; then
+            note="(${my_skip} ignored: ${my_ignored_files})"
+        fi
+
+        printf "%-20s | %-7s | %10s | %10s | %6s%% | %s\n" \
+            "${repo:0:20}" "$TARGET_BRANCH" "$(printf "%'d" $my_lines)" "$(printf "%'d" $total_lines)" "$share" "$note"
+
+        grand_my_lines=$((grand_my_lines + my_lines))
+        grand_total_lines=$((grand_total_lines + total_lines))
+    else
+        printf "%-20s | %-7s |      -     |      -     |    -   | (Repo not found)\n" "${repo:0:20}" "$TARGET_BRANCH"
+    fi
+done
+
+echo "-----------------------------------------------------------------------------------------"
+
+if [ "$grand_total_lines" -gt 0 ]; then
+    grand_share=$(awk "BEGIN {printf \"%.1f\", ($grand_my_lines / $grand_total_lines) * 100}")
+else
+    grand_share="0.0"
+fi
+
+echo "📝 自分の変更行数: $(printf "%'d" $grand_my_lines)"
+echo "🌍 全体の変更行数: $(printf "%'d" $grand_total_lines)"
+echo "🏆 総合貢献シェア: ${grand_share}%"
+echo ""
+
+# 言語別集計
+echo "📈 【自分の拡張子別内訳】"
+echo "----------------------------------------"
+printf "%-15s | %10s | %s\n" "Extension" "Lines" "Ratio"
+echo "----------------------------------------"
+
+awk -v total="$grand_my_lines" '
+{
+    lines = $1 + $2;
+    file = tolower($3);
+    m = split(file, names, "/");
+    filename = names[m];
+    n = split(filename, parts, ".");
+
+    if (n > 1) {
+        ext = parts[n];
+        if (index(filename, ".blade.php") > 0) ext = "blade.php";
+    } else { ext = filename; }
+
+    if (ext ~ /[{}]/) ext = "unknown";
+    if (ext == "") ext = "unknown";
+
+    count[ext] += lines;
+}
+END {
+    for (e in count) {
+        ratio = (total > 0) ? (count[e] / total) * 100 : 0;
+        printf "%s:%d:%.1f%%\n", e, count[e], ratio;
+    }
+}
+' "$ALL_LOGS" | sort -t: -k2 -nr | awk -F: '{printf "%-15s | %10s | %6s\n", $1, sprintf("%'\''d", $2), $3}'
+echo "----------------------------------------"
+rm "$ALL_LOGS"

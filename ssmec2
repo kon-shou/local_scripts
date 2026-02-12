@@ -1,0 +1,16 @@
+#!/bin/bash
+
+# AWS_PROFILEが設定されている場合はprofileオプションを追加
+PROFILE_OPTION=""
+if [ -n "${AWS_PROFILE}" ]; then
+    PROFILE_OPTION="--profile ${AWS_PROFILE}"
+fi
+
+selected_instance=$(aws ec2 describe-instances ${PROFILE_OPTION} --filters "Name=instance-state-name,Values=running" --query 'Reservations[*].Instances[*].[InstanceId, Tags[?Key==`Name`].Value | [0]]' --output text | fzf)
+
+instance_id=$(echo $selected_instance | awk '{print $1}')
+instance_name=$(echo $selected_instance | awk '{print $2}')
+
+echo "Start SSM connection to ${instance_name} ( ${instance_id} )..."
+
+aws ssm start-session ${PROFILE_OPTION} --target $instance_id;

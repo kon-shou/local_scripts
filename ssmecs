@@ -1,0 +1,64 @@
+#!/bin/bash
+
+# 環境指定チェック
+if [ -z "$1" ]; then
+    echo "Error: Environment must be specified" >&2
+    echo "Usage: $0 <env>" >&2
+    echo "Example: $0 prod" >&2
+    echo "         $0 stage" >&2
+    exit 1
+fi
+
+ENV=$1
+
+# 環境変数プレフィックスを大文字に変換
+ENV_UPPER=$(echo "$ENV" | tr '[:lower:]' '[:upper:]')
+
+# 環境変数名を動的に生成
+AWS_PROFILE_VAR="${ENV_UPPER}_AWS_PROFILE"
+ECS_CLUSTER_VAR="${ENV_UPPER}_ECS_CLUSTER"
+
+# 環境変数の値を取得
+AWS_PROFILE="${!AWS_PROFILE_VAR}"
+ECS_CLUSTER="${!ECS_CLUSTER_VAR}"
+
+# 必須パラメータチェック
+if [ -z "$AWS_PROFILE" ] || [ -z "$ECS_CLUSTER" ]; then
+    echo "Error: Required environment variables are not set" >&2
+    echo "Required: ${AWS_PROFILE_VAR}, ${ECS_CLUSTER_VAR}" >&2
+    exit 1
+fi
+
+# サービスを選択
+selected_service=$(aws ecs list-services --cluster "$ECS_CLUSTER" --profile "$AWS_PROFILE" --query "serviceArns[]" --output text | tr '\t' '\n' | fzf)
+
+if [ -z "$selected_service" ]; then
+  exit 0
+fi
+
+# タスクを選択
+selected_task=$(aws ecs list-tasks --profile "$AWS_PROFILE" --cluster "$ECS_CLUSTER" --service-name "${selected_service}" --query "taskArns[]" --output text | tr '\t' '\n' | fzf)
+
+if [ -z "$selected_task" ]; then
+  exit 0
+fi
+
+# コンテナを選択
+selected_container=$(aws ecs describe-tasks --profile "$AWS_PROFILE" --cluster "$ECS_CLUSTER" --tasks="${selected_task}" --query "tasks[].containers[].name" --output text | tr '\t' '\n' | fzf)
+
+if [ -z "$selected_container" ]; then
+  exit 0
+fi
+
+echo "SERVICE: ${selected_service}"
+echo "TASK: ${selected_task}"
+echo "CONTAINER: ${selected_container}"
+
+# ECS Execを実行
+aws ecs execute-command \
+    --cluster "$ECS_CLUSTER" \
+    --container "${selected_container}" \
+    --interactive \
+    --command "/bin/bash" \
+    --profile "$AWS_PROFILE" \
+    --task "${selected_task}"

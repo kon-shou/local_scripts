@@ -1,0 +1,64 @@
+#!/bin/bash
+
+# 出力結果を一時的に変数に格納
+output_data=""
+first_repo=true # 最初のレポジトリかどうかを判定するフラグ
+
+# GitHubユーザー名と実際の氏名のマッピング関数
+# USER_NAME_MAP環境変数（JSON形式）からマッピングを取得
+get_real_name() {
+  local github_username=$1
+  local real_name=""
+
+  # 環境変数からマッピングを取得（JSON形式）
+  if [ -n "$USER_NAME_MAP" ]; then
+    real_name=$(echo "$USER_NAME_MAP" | jq -r --arg user "$github_username" '.[$user] // $user')
+  else
+    # マッピングが設定されていない場合はGitHubユーザー名をそのまま使用
+    real_name=$github_username
+  fi
+
+  echo "$real_name"
+}
+
+for d in $RELEASE_REPOS; do
+  cd "$REPOS_BASE_PATH/${d}";
+
+  # リポジトリ名をそのまま出力データに追加
+  if [ "$first_repo" = true ]; then
+    first_repo=false
+  else
+    # 2つ目以降のリポジトリの場合、前に空白行を追加
+    output_data="$output_data"$'\n\n'
+  fi
+  output_data="$output_data$d"
+
+  git fetch > /dev/null 2>&1 # 標準エラー出力を抑制
+
+  for prNum in $(git log --merges --oneline origin/master..origin/development | grep -vE ' Merge commit ' | grep 'Merge pull request #' | sed -E 's/^.*Merge pull request #([0-9]+) .+$/\1/g'); do
+    if [[ ${prNum} =~ ^[0-9]+$ ]]; then
+      # developmentにしか存在しないはずのprNumがmasterに存在していたら、スキップ
+      if git log origin/master --oneline | grep -sqE "Merge pull request #${prNum}"; then
+        continue
+      fi
+
+      RESULT=$(gh pr view --repo="$ORGANIZATION/$d" $prNum --json author,title 2>/dev/null) # JSONでauthorとtitleを取得
+
+      # jqで値を取得し、sedで不要な空白を削除
+      AUTHOR_USERNAME=$(echo "$RESULT" | jq -r .author.login | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+      TITLE=$(echo "$RESULT" | jq -r .title | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+      URL="https://github.com/$ORGANIZATION/$d/pull/$prNum"
+
+      # author名を実際の氏名に変換
+      REAL_AUTHOR_NAME=$(get_real_name "$AUTHOR_USERNAME")
+
+      # 情報をタブ区切りで整形
+      current_line="${TITLE}\t${URL}\t${REAL_AUTHOR_NAME}"
+      output_data="$output_data"$'\n'"${current_line}"
+    fi
+  done;
+done;
+
+echo -e "$output_data"
+# 最終的なデータをクリップボードにコピー
+echo -e "$output_data" | pbcopy

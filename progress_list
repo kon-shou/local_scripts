@@ -1,0 +1,19 @@
+#!/bin/bash
+
+# 必須パラメータチェック
+if [ -z "$ORGANIZATION" ] || [ -z "$REPOS" ] || [ -z "$AUTHOR" ]; then
+    echo "Error: ORGANIZATION, REPOS, and AUTHOR must be set"
+    exit 1
+fi
+
+# メイン処理
+for d in $REPOS; do
+  echo "#### $d"
+
+  gh pr list --repo="$ORGANIZATION/${d}" --state="open" --author="$AUTHOR" --limit=1000 --json author,number,title,headRefName,additions,deletions \
+   | jq -r '.[] | [.number, .title, .headRefName, .additions, .deletions] | join("@@@@@@@@@@@@")' \
+   | awk -F '@@@@@@@@@@@@' '{print " - [#" $1 " " $2 "](https://github.com/'$ORGANIZATION'/'${d}'/pull/"$1 ") (`" $3 "`) (+" $4 " -" $5 ")"}' \
+   | tac
+
+  echo ""
+done

@@ -1,0 +1,373 @@
+#!/bin/bash
+
+# 1. PR番号と日付フィルタの特定
+PR_NUM=""
+DATE_FILTER=""
+
+# 引数の解析
+for arg in "$@"; do
+  if [[ "$arg" =~ ^[0-9]{1,2}-[0-9]{1,2}$ ]]; then
+    # MM-DD 形式の日付
+    DATE_FILTER="$arg"
+  elif [[ "$arg" =~ ^[0-9]+$ ]]; then
+    # PR番号
+    PR_NUM="$arg"
+  fi
+done
+
+# PR番号が指定されていない場合は現在のブランチから取得
+if [ -z "$PR_NUM" ]; then
+  PR_INFO=$(gh pr view --json number,url 2>/dev/null)
+  if [ $? -ne 0 ]; then
+    echo "Error: PRが見つかりません。PRのあるブランチにいるか、PR番号を指定してください。"
+    exit 1
+  fi
+  PR_NUM=$(echo "$PR_INFO" | jq -r .number | tr -d '[:space:]')
+fi
+
+# 日付フィルタが指定された場合、ISO 8601形式の日付を計算
+FILTER_DATE_ISO=""
+if [ -n "$DATE_FILTER" ]; then
+  CURRENT_YEAR=$(date +%Y)
+  CURRENT_DATE=$(date +%Y-%m-%d)
+
+  # YYYY-MM-DD 形式に変換
+  FILTER_DATE_THIS_YEAR="${CURRENT_YEAR}-${DATE_FILTER}"
+  FILTER_DATE_LAST_YEAR="$((CURRENT_YEAR - 1))-${DATE_FILTER}"
+
+  # 今年の日付が未来の場合は去年の日付を使用
+  if [[ "$FILTER_DATE_THIS_YEAR" > "$CURRENT_DATE" ]]; then
+    FILTER_DATE_ISO="${FILTER_DATE_LAST_YEAR}T00:00:00Z"
+  else
+    FILTER_DATE_ISO="${FILTER_DATE_THIS_YEAR}T00:00:00Z"
+  fi
+
+  echo "日付フィルタ: ${FILTER_DATE_ISO} 以降のコメントを表示"
+fi
+
+# 2. リポジトリ情報の取得
+REPO_INFO=$(gh repo view --json owner,name)
+OWNER=$(echo "$REPO_INFO" | jq -r .owner.login | tr -d '[:space:]')
+REPO=$(echo "$REPO_INFO" | jq -r .name | tr -d '[:space:]')
+
+echo "========================================================"
+echo " GitHub PR Timeline: #$PR_NUM ($OWNER/$REPO)"
+echo " (Feature: [ME] label for your own comments)"
+echo "========================================================"
+
+# 3. GraphQLクエリ
+QUERY="
+  query {
+    viewer {
+      login
+    }
+    repository(owner: \"$OWNER\", name: \"$REPO\") {
+      pullRequest(number: $PR_NUM) {
+        timelineItems(first: 100, itemTypes: [ISSUE_COMMENT, PULL_REQUEST_REVIEW]) {
+          nodes {
+            __typename
+            ... on IssueComment { id createdAt author { login __typename } body url }
+            ... on PullRequestReview {
+              id createdAt author { login __typename } state body url
+              comments(first: 100) {
+                nodes {
+                  id createdAt author { login __typename } body path line url
+                  diffHunk
+                  reactions(first: 20) {
+                    nodes {
+                      user { login }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        reviewThreads(first: 100) {
+          nodes {
+            comments(first: 50) {
+              nodes {
+                __typename id createdAt author { login __typename } body path line
+                url
+                pullRequestReview { id }
+                diffHunk
+                reactions(first: 20) {
+                  nodes {
+                    user { login }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+"
+
+# 4. 実行と整形
+gh api graphql -f query="$QUERY" | jq -r --arg filter_date "$FILTER_DATE_ISO" '
+  (if type == "array" then .[0] else . end) as $root |
+
+  # 自分のユーザー名
+  ($root.data.viewer.login // "") as $viewer_login |
+
+  # 日付フィルタ
+  $filter_date as $date_filter |
+
+  # --- 色・フォーマット定義 ---
+  def c_date:    "\u001b[30;1m";   # Gray
+  def c_user:    "\u001b[34m";     # Blue
+  def c_file:    "\u001b[33m";     # Yellow
+  def c_code:    "\u001b[36m";     # Cyan
+  def c_ok:      "\u001b[32m";     # Green
+  def c_warn:    "\u001b[31m";     # Red
+  def c_approve: "\u001b[35m";     # Magenta
+  def c_ctx:     "\u001b[90m";     # Dark Gray
+  def c_orange:  "\u001b[38;5;208m"; # Orange (REPLIED/REACTED)
+  def c_me:      "\u001b[1;34m";   # Bold Blue (ME) ★新規追加
+  def c_rst:     "\u001b[0m";
+
+  def fmt_date(d): (d | split("T") | .[0] + " " + (.[1] | split("Z")[0] | sub("\\.\\d+$";"")));
+  def indent(s; prefix): (s | tostring | gsub("\r"; "") | split("\n") | map(prefix + "\(.)") | join("\n"));
+
+  # --- データ処理 ---
+
+  # 0. リプライ済みIDの特定
+  ($root.data.repository.pullRequest.reviewThreads.nodes // []
+    | map(.comments.nodes // [])
+    | map(
+        if length > 1 then
+          .[0:-1] | map(.id)
+        else
+          []
+        end
+      )
+    | flatten
+    | unique
+  ) as $replied_ids |
+
+  # 1. コードコメントの正規化
+  ($root.data.repository.pullRequest.reviewThreads.nodes // []
+    | map(.comments.nodes // [])
+    | map(
+        . as $thread_comments |
+        to_entries | map(
+          .key as $idx | .value |
+
+          # 各種フラグ判定
+          (.reactions.nodes // [] | map(.user.login) | index($viewer_login)) as $has_reacted |
+          (.id as $my_id | $replied_ids | index($my_id)) as $is_replied |
+          (.author.login == $viewer_login) as $is_mine | # ★自分の投稿か
+
+          {
+            type: "CODE_COMMENT",
+            id: .id,
+            createdAt: .createdAt,
+            author: .author.login,
+            body: .body,
+            path: .path,
+            line: .line,
+            url: .url,
+            parent_id: (.pullRequestReview.id // "NULL"),
+            diff_hunk: .diffHunk,
+            context: ($thread_comments[0:$idx] | map({author: .author.login, body: .body})),
+
+            # フラグ保持
+            is_replied: $is_replied,
+            is_reacted: $has_reacted,
+            is_mine:    $is_mine,
+
+            # ★グレーアウト対象: リプライあり OR リアクションあり OR 自分の投稿
+            is_done: ($is_replied or $has_reacted or $is_mine)
+          }
+        )
+      )
+    | flatten
+    | map(select(.author != "github-actions"))
+  ) as $all_code_comments |
+
+  # 2. レビューから直接取得したコメント
+  ($root.data.repository.pullRequest.timelineItems.nodes // []
+    | map(select(.__typename == "PullRequestReview" and .author.__typename != "Bot" and .author.login != "github-actions"))
+    | map(
+        .id as $review_id |
+        (.comments.nodes // []) | map(
+          # 各種フラグ判定
+          (.reactions.nodes // [] | map(.user.login) | index($viewer_login)) as $has_reacted |
+          (.id as $my_id | $replied_ids | index($my_id)) as $is_replied |
+          (.author.login == $viewer_login) as $is_mine |
+
+          {
+            type: "CODE_COMMENT",
+            id: .id,
+            createdAt: .createdAt,
+            author: .author.login,
+            body: .body,
+            path: .path,
+            line: .line,
+            url: .url,
+            parent_id: $review_id,
+            diff_hunk: .diffHunk,
+            context: [],
+
+            # フラグ保持
+            is_replied: $is_replied,
+            is_reacted: $has_reacted,
+            is_mine:    $is_mine,
+
+            # グレーアウト対象
+            is_done: ($is_replied or $has_reacted or $is_mine)
+          }
+        )
+      )
+    | flatten
+  ) as $review_comments |
+
+  # 3. タイムライン
+  ($root.data.repository.pullRequest.timelineItems.nodes // []
+    | map(select(.author.__typename != "Bot" and .author.login != "github-actions"))
+    | map(
+        if .__typename == "PullRequestReview" then
+          {
+            type: "REVIEW_EVENT",
+            id: .id,
+            createdAt: .createdAt,
+            author: .author.login,
+            state: .state,
+            body: .body,
+            url: .url,
+            parent_id: .id
+          }
+        else
+          {
+            type: "ISSUE_COMMENT",
+            id: .id,
+            createdAt: .createdAt,
+            author: .author.login,
+            body: .body,
+            url: .url,
+            parent_id: .id
+          }
+        end
+      )
+  ) as $timeline_events |
+
+  # --- グルーピングと出力 ---
+
+  # reviewThreadsとPullRequestReview.commentsのコメントをマージ（重複排除）
+  (($all_code_comments + $review_comments) | unique_by(.id)) as $merged_comments |
+
+  ($timeline_events + $merged_comments)
+  | group_by(if .parent_id == "NULL" then .id else .parent_id end)
+  | sort_by(.[0].createdAt)
+  | .[]
+  | . as $group
+
+  # --- 日付フィルタ適用 ---
+  | if $date_filter != "" then
+      # グループの最初の要素（ヘッダー）の日付をチェック
+      if ($group[0].createdAt >= $date_filter) then .
+      else empty
+      end
+    else .
+    end
+
+  # --- 表示ロジック ---
+  | (
+      ($group | map(select(.type == "REVIEW_EVENT" or .type == "ISSUE_COMMENT")) | .[0]) as $header_obj |
+      ($header_obj // $group[0]) as $head |
+      ($group | map(select(.type == "CODE_COMMENT")) | sort_by(.path, .line)) as $comments |
+
+      # 1. ヘッダー
+      (
+        "\(c_date)[\(fmt_date($head.createdAt))]\(c_rst) \(c_user)@\($head.author)\(c_rst) " +
+        (
+          if $head.type == "REVIEW_EVENT" then
+            if $head.state == "APPROVED" then "\(c_approve)[REVIEW: APPROVED]\(c_rst)"
+            elif $head.state == "CHANGES_REQUESTED" then "\(c_warn)[REVIEW: CHANGES_REQUESTED]\(c_rst)"
+            elif $head.state == "COMMENTED" then "[REVIEW: COMMENTED]"
+            else "[REVIEW: \($head.state)]"
+            end
+          elif $head.type == "ISSUE_COMMENT" then
+            "[COMMENT]"
+          else
+            "[CODE COMMENT]"
+          end
+        )
+      ) as $str_header |
+
+      # 2. レビュー本文
+      (
+        if ($head.body? | length > 0) and $head.type != "CODE_COMMENT" then
+          indent($head.body; "  :: ")
+        else
+          ""
+        end
+      ) as $str_body |
+
+      # 3. コードコメント文字列
+      (
+        if ($comments | length) > 0 then
+          ($comments
+            | map(
+                . as $c |
+
+                # --- Grayed Out (Done: ME / REPLIED / REACTED) ---
+                if .is_done then
+                    (
+                      if .is_mine then "\(c_me)[ME]"
+                      elif .is_replied and .is_reacted then "\(c_orange)[REPLIED] [REACTED]"
+                      elif .is_replied then "\(c_orange)[REPLIED]"
+                      else "\(c_orange)[REACTED]"
+                      end
+                    ) as $label_text |
+
+                    "\n  \($label_text)\(c_rst)" +
+                    "\n  \(c_ctx)// [CODE] \(.path): \(.line // "outdated") (\(.url))\(c_rst)\n" +
+
+                    (if (.diff_hunk | length > 0) then
+                       (.diff_hunk | split("\n") | map(
+                          "  \(c_ctx)//   | \(.)\(c_rst)"
+                       ) | join("\n")) + "\n"
+                     else "" end) +
+                    (if (.context | length > 0) then
+                       (.context | map(
+                          "  \(c_ctx)//   (Replying to @\(.author): \(.body | gsub("\r"; "") | gsub("\n"; " ") | .[0:60])...)\(c_rst)"
+                       ) | join("\n") + "\n" )
+                     else "" end) +
+                    indent(.body; "  \(c_ctx)//   :: ") + "\(c_rst)"
+
+                # --- Active (Review needed) ---
+                else
+                    "\n  \(c_file)[CODE] \(.path):\(.line // "outdated")\(c_rst) \(c_ctx)(\(.url))\(c_rst)\n" +
+                    (if (.diff_hunk | length > 0) then
+                       (.diff_hunk | split("\n") | map(
+                          if startswith("+") then "    \(c_ok)| \(.)\(c_rst)"
+                          elif startswith("-") then "    \(c_warn)| \(.)\(c_rst)"
+                          else "    \(c_code)| \(.)\(c_rst)"
+                          end
+                       ) | join("\n")) + "\n"
+                     else "" end) +
+                    (if (.context | length > 0) then
+                       (.context | map(
+                          "    \(c_ctx)(Replying to @\(.author): \(.body | gsub("\r"; "") | gsub("\n"; " ") | .[0:60])...)\(c_rst)"
+                       ) | join("\n") + "\n")
+                     else "" end) +
+                    indent(.body; "    :: ")
+                end
+              )
+            | join("\n")
+          )
+        else
+          ""
+        end
+      ) as $str_comments |
+
+      # === 最終結合 ===
+      $str_header +
+      (if ($str_body | length > 0) then "\n" + $str_body else "" end) +
+      (if ($str_comments | length > 0) then "\n" + $str_comments else "" end) +
+      "\n\n--------------------------------------------------------"
+  )
+'

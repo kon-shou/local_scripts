@@ -1,0 +1,26 @@
+#!/bin/bash
+
+# 必須パラメータチェック
+if [ -z "$ORGANIZATION" ] || [ -z "$REPOS" ]; then
+    echo "Error: ORGANIZATION and REPOS must be set"
+    exit 1
+fi
+
+# メイン処理
+for d in $REPOS; do
+  echo "#### $d"
+
+  # jq の select 条件を動的に生成
+  if [ -n "$EXCLUDE_AUTHOR" ]; then
+    JQ_FILTER=".[] | select(.author.login != \"$EXCLUDE_AUTHOR\") | [.number, .title] | join(\"@@@@@@@@@@@@\")"
+  else
+    JQ_FILTER=".[] | [.number, .title] | join(\"@@@@@@@@@@@@\")"
+  fi
+
+  gh pr list --repo="$ORGANIZATION/${d}" --state="open" --search="user-review-requested:$USER" --limit=1000 --json author,number,title \
+   | jq -r "$JQ_FILTER" \
+   | awk -F '@@@@@@@@@@@@' '{print " - [#" $1 " " $2 "](https://github.com/'$ORGANIZATION'/'${d}'/pull/"$1 ") "}' \
+   | tac
+
+  echo ""
+done

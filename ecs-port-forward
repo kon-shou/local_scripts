@@ -1,0 +1,61 @@
+#!/bin/bash
+
+# 環境指定チェック
+if [ -z "$1" ]; then
+    echo "Error: Environment must be specified" >&2
+    echo "Usage: $0 <env>" >&2
+    echo "Example: $0 prod" >&2
+    echo "         $0 stage" >&2
+    exit 1
+fi
+
+ENV=$1
+
+# 環境変数プレフィックスを大文字に変換
+ENV_UPPER=$(echo "$ENV" | tr '[:lower:]' '[:upper:]')
+
+# 環境変数名を動的に生成
+AWS_PROFILE_VAR="${ENV_UPPER}_AWS_PROFILE"
+ECS_CLUSTER_VAR="${ENV_UPPER}_ECS_CLUSTER"
+ECS_SERVICE_VAR="${ENV_UPPER}_ECS_SERVICE"
+LOCAL_PORT_VAR="${ENV_UPPER}_LOCAL_PORT"
+REMOTE_PORT_VAR="${ENV_UPPER}_REMOTE_PORT"
+RDS_HOST_VAR="${ENV_UPPER}_RDS_HOST"
+
+# 環境変数の値を取得
+AWS_PROFILE="${!AWS_PROFILE_VAR}"
+ECS_CLUSTER="${!ECS_CLUSTER_VAR}"
+ECS_SERVICE="${!ECS_SERVICE_VAR}"
+LOCAL_PORT="${!LOCAL_PORT_VAR}"
+REMOTE_PORT="${!REMOTE_PORT_VAR}"
+RDS_HOST="${!RDS_HOST_VAR}"
+
+# 必須パラメータチェック
+if [ -z "$AWS_PROFILE" ] || [ -z "$ECS_CLUSTER" ] || [ -z "$ECS_SERVICE" ] || [ -z "$LOCAL_PORT" ] || [ -z "$REMOTE_PORT" ] || [ -z "$RDS_HOST" ]; then
+    echo "Error: Required environment variables are not set" >&2
+    echo "Required: ${AWS_PROFILE_VAR}, ${ECS_CLUSTER_VAR}, ${ECS_SERVICE_VAR}, ${LOCAL_PORT_VAR}, ${REMOTE_PORT_VAR}, ${RDS_HOST_VAR}" >&2
+    exit 1
+fi
+
+# Task IDを取得
+task_id=$(aws ecs list-tasks \
+    --profile "$AWS_PROFILE" \
+    --cluster "$ECS_CLUSTER" \
+    --service-name "$ECS_SERVICE" \
+    --query 'taskArns[0]' --output text | awk -F '/' '{print $3}')
+
+# Container Runtime IDを取得
+container_runtime_id=$(aws ecs describe-tasks \
+    --profile "$AWS_PROFILE" \
+    --cluster "$ECS_CLUSTER" \
+    --tasks "$task_id" \
+    --query 'tasks[0].containers[0].runtimeId' --output text)
+
+echo "[$ENV_UPPER] Start Port Forwarding. local:aws = $LOCAL_PORT:$REMOTE_PORT"
+
+# ポートフォワーディング開始
+aws ssm start-session \
+    --profile "$AWS_PROFILE" \
+    --target "ecs:${ECS_CLUSTER}_${task_id}_${container_runtime_id}" \
+    --document-name AWS-StartPortForwardingSessionToRemoteHost \
+    --parameters "{\"portNumber\":[\"$REMOTE_PORT\"],\"localPortNumber\":[\"$LOCAL_PORT\"],\"host\":[\"$RDS_HOST\"]}"

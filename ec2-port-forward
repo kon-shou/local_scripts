@@ -1,0 +1,9 @@
+#!/bin/bash
+
+echo "[EC2] Start Port Forwarding. local:aws = ${LOCAL_PORT}:${REMOTE_PORT}"
+
+aws ssm start-session \
+  --profile "$AWS_PROFILE" \
+  --target "$EC2_INSTANCE_ID" \
+  --document-name AWS-StartPortForwardingSessionToRemoteHost \
+  --parameters "{\"portNumber\":[\"${REMOTE_PORT}\"],\"localPortNumber\":[\"${LOCAL_PORT}\"],\"host\":[\"${RDS_HOST}\"]}";

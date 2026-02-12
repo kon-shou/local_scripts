@@ -1,0 +1,80 @@
+#!/bin/bash
+
+# ==========================================
+# 【設定】デフォルト値（環境変数で上書き可能）
+# ==========================================
+LOCAL_ROOT="${REPOS_BASE_PATH:-$HOME}"
+MONTHS_AGO="${REPO_AUTHORS_MONTHS_AGO:-12}"
+MASTER_REPOS="${REPO_AUTHORS_MASTER_REPOS}"
+EXCLUDE_PATTERN="${REPO_AUTHORS_EXCLUDE_PATTERN}"
+
+# 除外パターン & 行数制限
+MAX_LINES_LIMIT="${REPO_AUTHORS_MAX_LINES:-50000}"
+# ==========================================
+
+if date -v -${MONTHS_AGO}m > /dev/null 2>&1; then
+    SINCE_DATE=$(date -v -${MONTHS_AGO}m +%Y-%m-%d)
+else
+    SINCE_DATE=$(date -d "${MONTHS_AGO} months ago" +%Y-%m-%d)
+fi
+
+echo "📊 Author別 変更行数ランキング (${SINCE_DATE} 〜 本日)"
+echo "⚠️  除外条件: magicpod, lockファイル, 1ファイル${MAX_LINES_LIMIT}行以上"
+echo "======================================================================"
+
+for repo in $REPOS; do
+    repo_path="${LOCAL_ROOT}/${repo}"
+
+    # ブランチ判定（環境変数化）
+    if echo " ${MASTER_REPOS} " | grep -q " ${repo} "; then
+        TARGET_BRANCH="master"
+    else
+        TARGET_BRANCH="main"
+    fi
+    TARGET_REF="origin/$TARGET_BRANCH"
+
+    if [ -d "$repo_path/.git" ]; then
+        echo ""
+        echo "📂 [${repo}] (Branch: ${TARGET_BRANCH})"
+        echo "--------------------------------------------------"
+
+        # 1. Fetch
+        git -C "$repo_path" fetch origin "$TARGET_BRANCH" >/dev/null 2>&1
+
+        # 2. ログ取得 & 集計
+        git -C "$repo_path" log "$TARGET_REF" --since="$SINCE_DATE" --no-merges --numstat --format="AUTHOR:%an" --no-renames \
+            | grep -vE "$EXCLUDE_PATTERN" \
+            | awk -v limit="$MAX_LINES_LIMIT" '
+                /^AUTHOR:/ {
+                    current_auth = substr($0, 8);
+                    next;
+                }
+                {
+                    if ($1 ~ /^[0-9]+$/) {
+                        lines = $1 + $2;
+                        if (lines <= limit) {
+                            sum[current_auth] += lines;
+                        }
+                    }
+                }
+                END {
+                    for (auth in sum) {
+                        printf "%d\t%s\n", sum[auth], auth;
+                    }
+                }
+            ' \
+            | sort -nr \
+            | awk '{
+                lines=$1;
+                $1="";
+                sub(/^ /, ""); # 先頭のスペース削除
+                printf "  %2d. %-30s : %'\''d lines\n", NR, $0, lines
+            }' | head -n 15
+
+    else
+        echo "❌ [${repo}] Not found"
+    fi
+done
+
+echo ""
+echo "======================================================================"

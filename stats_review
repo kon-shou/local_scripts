@@ -1,0 +1,387 @@
+#!/bin/bash
+
+# ==========================================
+# 【設定】デフォルト値（環境変数で上書き可能）
+# ==========================================
+LOCAL_ROOT="${REPOS_BASE_PATH}"
+REPOS="${REPOS}"
+ME="${AUTHOR}" # あなたのGitHub ID
+PR_LIMIT="${STATS_REVIEW_PR_LIMIT:-100}" # 集計対象のPR件数
+SAMPLE_LIMIT="${STATS_REVIEW_SAMPLE_LIMIT:-100}" # 平均レビュー時間計算のサンプリング数
+
+# 色の定義
+GREEN=$'\033[0;32m'
+RED=$'\033[0;31m'
+RESET=$'\033[0m'
+# ==========================================
+
+# 時間変換関数
+format_seconds() {
+    local T=$1
+    local D=$((T/60/60/24))
+    local H=$((T/60/60%24))
+    local M=$((T/60%60))
+
+    if [ "$D" -gt 0 ]; then
+        printf "%d日 %d時間" "$D" "$H"
+    elif [ "$H" -gt 0 ]; then
+        printf "%d時間 %d分" "$H" "$M"
+    else
+        printf "%d分" "$M"
+    fi
+}
+
+echo "📊 レビュー貢献・速度指標集計（チーム比較付き）"
+echo "👤 Reviewer: ${ME}"
+echo "📦 集計対象: 各リポジトリの直近 ${PR_LIMIT}件のマージ済みPR（【release】【hotfix】除く、reviewersチーム指定必須）"
+echo "⏱  滞留時間計測: 自分がレビューしたPRの直近 ${SAMPLE_LIMIT}件から算出"
+echo "   (※ reviewersチーム指定時刻 〜 あなたの最初のコメント/レビュー までの時間)"
+echo "   (※ vs Team(Time): 2.0x速い = チームより2倍速い、1.5x遅い = チームより1.5倍遅い)"
+echo "--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------"
+printf "%-20s | %-8s | %-8s | %-8s | %-10s | %-14s | %-16s | %-16s | %-13s\n" "Repository" "Others" "Reviewed" "My Rate" "Team Avg" "vs Team(Rate)" "My Lead Time" "Team Lead Time" "vs Team(Time)"
+echo "--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------"
+
+# 現在のディレクトリを保存
+ORIGINAL_DIR=$(pwd)
+
+for repo in $REPOS; do
+    REPO_PATH="${LOCAL_ROOT}/${repo}"
+
+    # リポジトリディレクトリが存在しない場合はスキップ
+    if [ ! -d "$REPO_PATH" ]; then
+        printf "%-20s | %-12s | %-12s | %-8s | %s\n" "${repo:0:20}" "-" "-" "-" "(Dir not found)"
+        continue
+    fi
+
+    # リポジトリディレクトリに移動
+    cd "$REPO_PATH" 2>/dev/null || {
+        printf "%-20s | %-12s | %-12s | %-8s | %s\n" "${repo:0:20}" "-" "-" "-" "(Cannot cd)"
+        continue
+    }
+
+    # リポジトリ情報を取得
+    REPO_INFO=$(gh repo view --json owner,name 2>/dev/null)
+    if [ $? -ne 0 ]; then
+        printf "%-20s | %-12s | %-12s | %-8s | %s\n" "${repo:0:20}" "-" "-" "-" "(Not a gh repo)"
+        cd "$ORIGINAL_DIR"
+        continue
+    fi
+
+    OWNER=$(echo "$REPO_INFO" | jq -r .owner.login | tr -d '[:space:]')
+    REPO_NAME=$(echo "$REPO_INFO" | jq -r .name | tr -d '[:space:]')
+
+    # GraphQL クエリで PR データを取得
+    # 1. 他人のPR総数（マージ済み、自分以外の作成者）
+    # 2. 自分がレビューしたPR数
+    # 3. 自分がレビューしたPRの詳細（レビュー時間計算用）
+
+    QUERY="
+    query {
+        viewer { login }
+        repository(owner: \"$OWNER\", name: \"$REPO_NAME\") {
+            pullRequests(
+                first: $PR_LIMIT,
+                states: MERGED,
+                orderBy: {field: CREATED_AT, direction: DESC}
+            ) {
+                totalCount
+                nodes {
+                    number
+                    title
+                    createdAt
+                    author { login }
+                    reviews(first: 100) {
+                        nodes {
+                            author { login }
+                            submittedAt
+                        }
+                    }
+                    comments(first: 100) {
+                        nodes {
+                            author { login }
+                            createdAt
+                        }
+                    }
+                    timelineItems(first: 100, itemTypes: [REVIEW_REQUESTED_EVENT]) {
+                        nodes {
+                            ... on ReviewRequestedEvent {
+                                createdAt
+                                requestedReviewer {
+                                    ... on Team {
+                                        slug
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    "
+
+    # API呼び出し前にスリープ（レート制限回避）
+    sleep 2
+
+    # GraphQL APIを実行（エラー出力もキャプチャ）
+    API_RESPONSE=$(gh api graphql -f query="$QUERY" 2>&1)
+    API_EXIT_CODE=$?
+
+    # APIエラーチェック
+    if [ $API_EXIT_CODE -ne 0 ]; then
+        ERROR_MSG=$(echo "$API_RESPONSE" | head -n 1 | cut -c1-60)
+        printf "%-20s | %-12s | %-12s | %-8s | %s\n" "${repo:0:20}" "-" "-" "-" "(API error: $ERROR_MSG)"
+        cd "$ORIGINAL_DIR"
+        continue
+    fi
+
+    # jqで集計
+    RESULT=$(echo "$API_RESPONSE" | jq -r --arg ME "$ME" --argjson SAMPLE_LIMIT "$SAMPLE_LIMIT" '
+        # 自分のユーザー名（viewerから取得）
+        .data.viewer.login as $viewer_login |
+
+        # PRリストを取得（直近PR_LIMIT件のマージ済みPR）
+        # タイトルに【release】または【hotfix】が含まれるPRを除外（大文字小文字区別なし）
+        # 全角【】、半角[]、括弧なしの3パターンに対応
+        # reviewersチーム指定がないPRを除外
+        .data.repository.pullRequests.nodes
+        | map(select(
+            (.title | test("(release|hotfix)"; "i") | not) and
+            (.title | test("\\[(release|hotfix)\\]"; "i") | not) and
+            (.title | test("^(release|hotfix)"; "i") | not) and
+            (.timelineItems.nodes // [] | map(select(.requestedReviewer.slug == "reviewers")) | length > 0)
+        )) as $prs |
+
+        # 1. 他人が作成したPR（自分以外）
+        ($prs | map(select(.author.login != $ME))) as $others_prs |
+        ($others_prs | length) as $total_others_count |
+
+        # 2. 自分がレビューしたPR
+        ($others_prs | map(
+            select(
+                (.reviews.nodes // [] | map(.author.login) | index($ME)) or
+                (.comments.nodes // [] | map(.author.login) | index($ME))
+            )
+        )) as $reviewed_prs |
+        ($reviewed_prs | length) as $reviewed_count |
+
+        # 3. レビュー率
+        (if $total_others_count > 0 then
+            ($reviewed_count / $total_others_count * 100)
+        else 0 end) as $review_rate |
+
+        # 4. 平均レビュー時間（サンプリング）
+        ($reviewed_prs[0:$SAMPLE_LIMIT] | map(
+            # レビューリクエスト時刻を取得（reviewersチーム指定時刻）
+            (
+                .timelineItems.nodes // []
+                | map(select(.requestedReviewer.slug == "reviewers") | .createdAt)
+                | .[0]
+            ) as $review_requested_at |
+
+            # 開始時刻：チーム指定があればその時刻、なければPR作成時刻
+            (if $review_requested_at then $review_requested_at else .createdAt end) as $start_time |
+
+            # 自分の最初のアクション時刻
+            (
+                [
+                    (.reviews.nodes // [] | map(select(.author.login == $ME) | .submittedAt)),
+                    (.comments.nodes // [] | map(select(.author.login == $ME) | .createdAt))
+                ] | flatten | map(select(. != null)) | sort | .[0]
+            ) as $first_action |
+
+            if $first_action then
+                (($first_action | fromdateiso8601) - ($start_time | fromdateiso8601))
+            else
+                null
+            end
+        ) | map(select(. != null and . >= 0))) as $review_times |
+
+        ($review_times | length) as $sample_count |
+        (if $sample_count > 0 then
+            ($review_times | add / $sample_count | floor)
+        else
+            null
+        end) as $avg_seconds |
+
+        # === チーム統計の計算 ===
+
+        # 5. 各PRに対して、誰がレビューしたかを集計
+        ($others_prs | map(
+            # 各PRのレビュアーリストを作成（重複排除）
+            [
+                (.reviews.nodes // [] | map(.author.login)),
+                (.comments.nodes // [] | map(.author.login))
+            ] | flatten | unique | map(select(. != null and . != "github-actions"))
+        )) as $pr_reviewers_list |
+
+        # 6. 全レビュアーのリストを取得（自分を除く）
+        ($pr_reviewers_list | flatten | unique | map(select(. != $ME))) as $team_members |
+
+        # 7. チームメンバーごとのレビュー数をカウント
+        ($team_members | map(
+            . as $member |
+            {
+                member: $member,
+                count: ($pr_reviewers_list | map(select(index($member))) | length)
+            }
+        )) as $team_review_counts |
+
+        # 8. チーム平均レビュー率
+        (if ($team_members | length) > 0 then
+            (($team_review_counts | map(.count) | add) / (($team_members | length) * $total_others_count) * 100)
+        else
+            null
+        end) as $team_avg_rate |
+
+        # 9. チーム平均レビュー時間
+        # 各メンバーの平均レビュー時間を計算し、その平均を取る
+        ($team_members | map(
+            . as $member |
+            ($others_prs | map(
+                # このメンバーがレビューしたPRのみ
+                select(
+                    (.reviews.nodes // [] | map(.author.login) | index($member)) or
+                    (.comments.nodes // [] | map(.author.login) | index($member))
+                ) |
+
+                # レビューリクエスト時刻を取得（reviewersチーム指定時刻）
+                (
+                    .timelineItems.nodes // []
+                    | map(select(.requestedReviewer.slug == "reviewers") | .createdAt)
+                    | .[0]
+                ) as $review_requested_at |
+
+                # 開始時刻：チーム指定があればその時刻、なければPR作成時刻
+                (if $review_requested_at then $review_requested_at else .createdAt end) as $start_time |
+
+                # メンバーの最初のアクション時刻
+                (
+                    [
+                        (.reviews.nodes // [] | map(select(.author.login == $member) | .submittedAt)),
+                        (.comments.nodes // [] | map(select(.author.login == $member) | .createdAt))
+                    ] | flatten | map(select(. != null)) | sort | .[0]
+                ) as $first_action |
+
+                if $first_action then
+                    (($first_action | fromdateiso8601) - ($start_time | fromdateiso8601))
+                else
+                    null
+                end
+            ) | map(select(. != null and . >= 0)))
+        ) | map(if length > 0 then (add / length) else null end) | map(select(. != null))) as $team_review_times |
+
+        (if ($team_review_times | length) > 0 then
+            ($team_review_times | add / length | floor)
+        else
+            null
+        end) as $team_avg_seconds |
+
+        # 結果を出力
+        {
+            total_others_count: $total_others_count,
+            reviewed_count: $reviewed_count,
+            review_rate: $review_rate,
+            avg_seconds: $avg_seconds,
+            team_avg_rate: $team_avg_rate,
+            team_avg_seconds: $team_avg_seconds
+        } | @json
+    ')
+
+    # jqの結果をパース
+    if [ -z "$RESULT" ] || [ "$RESULT" = "null" ]; then
+        printf "%-20s | %-12s | %-12s | %-8s | %s\n" "${repo:0:20}" "-" "-" "-" "(Parse error)"
+        cd "$ORIGINAL_DIR"
+        continue
+    fi
+
+    total_others_count=$(echo "$RESULT" | jq -r .total_others_count)
+    reviewed_count=$(echo "$RESULT" | jq -r .reviewed_count)
+    review_rate=$(echo "$RESULT" | jq -r .review_rate)
+    avg_seconds=$(echo "$RESULT" | jq -r .avg_seconds)
+    team_avg_rate=$(echo "$RESULT" | jq -r .team_avg_rate)
+    team_avg_seconds=$(echo "$RESULT" | jq -r .team_avg_seconds)
+
+    # レビュー率のフォーマット
+    review_rate_str=$(printf "%.1f%%" "$review_rate")
+
+    # チーム平均レビュー率のフォーマット
+    if [ "$team_avg_rate" != "null" ] && [ -n "$team_avg_rate" ]; then
+        team_avg_rate_str=$(printf "%.1f%%" "$team_avg_rate")
+        # vs Team（差分）
+        diff=$(awk "BEGIN {printf \"%.1f\", $review_rate - $team_avg_rate}")
+        if (( $(awk "BEGIN {print ($diff > 0)}") )); then
+            # プラス（良い）→緑色
+            visible_str=$(printf "+%.1f%%" "$diff")
+            vs_team_str="${GREEN}${visible_str}${RESET}"
+            # パディング用に可視文字列の長さを計算（列幅14）
+            padding=$((14 - ${#visible_str}))
+            vs_team_str="${vs_team_str}$(printf "%${padding}s" "")"
+        else
+            # マイナス（悪い）→赤色
+            visible_str=$(printf "%.1f%%" "$diff")
+            vs_team_str="${RED}${visible_str}${RESET}"
+            # パディング用に可視文字列の長さを計算（列幅14）
+            padding=$((14 - ${#visible_str}))
+            vs_team_str="${vs_team_str}$(printf "%${padding}s" "")"
+        fi
+    else
+        team_avg_rate_str="-"
+        vs_team_str=$(printf "%-14s" "-")
+    fi
+
+    # 平均時間のフォーマット
+    if [ "$avg_seconds" != "null" ] && [ -n "$avg_seconds" ]; then
+        avg_time_str=$(format_seconds "$avg_seconds")
+    else
+        avg_time_str="-"
+    fi
+
+    # チーム平均時間のフォーマット
+    if [ "$team_avg_seconds" != "null" ] && [ -n "$team_avg_seconds" ]; then
+        team_avg_time_str=$(format_seconds "$team_avg_seconds")
+
+        # vs Team (Time) の差分を計算（M倍速い/遅い）
+        if [ "$avg_seconds" != "null" ] && [ -n "$avg_seconds" ]; then
+            # 自分の方が速い場合：チーム平均 / 自分の時間 = 何倍速いか
+            # 自分の方が遅い場合：自分の時間 / チーム平均 = 何倍遅いか
+            if (( $(awk "BEGIN {print ($avg_seconds < $team_avg_seconds)}") )); then
+                # 速い場合（良い）→緑色
+                multiplier=$(awk "BEGIN {printf \"%.1f\", $team_avg_seconds / $avg_seconds}")
+                visible_str=$(printf "%.1fx速い" "$multiplier")
+                vs_team_time_str="${GREEN}${visible_str}${RESET}"
+                # パディング用に可視文字列の長さを計算（列幅13）
+                # 日本語の「速い」は2文字だが、バイト数で計算する必要がある
+                visible_len=$(echo -n "$visible_str" | wc -m | tr -d ' ')
+                padding=$((13 - visible_len))
+                vs_team_time_str="${vs_team_time_str}$(printf "%${padding}s" "")"
+            elif (( $(awk "BEGIN {print ($avg_seconds > $team_avg_seconds)}") )); then
+                # 遅い場合（悪い）→赤色
+                multiplier=$(awk "BEGIN {printf \"%.1f\", $avg_seconds / $team_avg_seconds}")
+                visible_str=$(printf "%.1fx遅い" "$multiplier")
+                vs_team_time_str="${RED}${visible_str}${RESET}"
+                # パディング用に可視文字列の長さを計算（列幅13）
+                visible_len=$(echo -n "$visible_str" | wc -m | tr -d ' ')
+                padding=$((13 - visible_len))
+                vs_team_time_str="${vs_team_time_str}$(printf "%${padding}s" "")"
+            else
+                # 同じ
+                vs_team_time_str=$(printf "%-13s" "同じ")
+            fi
+        else
+            vs_team_time_str=$(printf "%-13s" "-")
+        fi
+    else
+        team_avg_time_str="-"
+        vs_team_time_str=$(printf "%-13s" "-")
+    fi
+
+    # 結果を表示
+    printf "%-20s | %-8s | %-8s | %-8s | %-10s | %s | %-16s | %-16s | %s\n" \
+        "${repo:0:20}" "$total_others_count" "$reviewed_count" "$review_rate_str" "$team_avg_rate_str" "$vs_team_str" "$avg_time_str" "$team_avg_time_str" "$vs_team_time_str"
+
+    # 元のディレクトリに戻る
+    cd "$ORIGINAL_DIR"
+done
+
+echo "--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------"
