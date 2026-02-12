@@ -1,29 +1,141 @@
 #!/bin/bash
 
+# ヘルプ関数
+show_help() {
+  cat << EOF
+Usage: $0 [OPTIONS]
+
+Calculate contribution share for Git repositories.
+
+Options:
+  --months-ago=N        Calculate statistics for the last N months
+  --months-ago N        (alternative format)
+  --since=YYYY-MM-DD    Calculate statistics since the specified date
+  --since YYYY-MM-DD    (alternative format)
+  -h, --help            Show this help message
+
+Priority (when multiple sources are specified):
+  1. --since option (highest)
+  2. --months-ago option
+  3. Positional argument (deprecated, no longer supported)
+  4. STATS_GITHUB_SINCE_DATE environment variable (deprecated)
+
+Examples:
+  $0 --months-ago=12
+  $0 --since=2024-01-01
+
+Environment Variables:
+  REPOS                 List of repositories to analyze (required)
+  REPOS_BASE_PATH       Base directory for repositories (required)
+  STATS_GITHUB_AUTHOR_PATTERN  Author pattern to match (required)
+  STATS_GITHUB_SINCE_DATE  Default since date (deprecated, lowest priority)
+  REPO_AUTHORS_EXCLUDE_PATTERN  Pattern to exclude from statistics
+  REPO_AUTHORS_MAX_LINES  Maximum lines threshold (default: 50000)
+  STATS_GITHUB_MASTER_REPOS  Space-separated list of repos using 'master' branch
+
+Description:
+  This script calculates your contribution share across multiple
+  Git repositories, showing both per-repository and overall statistics.
+EOF
+}
+
+# デフォルト値
+MONTHS_AGO=""
+SINCE_DATE=""
+
+# オプション解析
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --months-ago)
+      MONTHS_AGO="$2"
+      shift 2
+      ;;
+    --months-ago=*)
+      MONTHS_AGO="${1#*=}"
+      shift
+      ;;
+    --since)
+      SINCE_DATE="$2"
+      shift 2
+      ;;
+    --since=*)
+      SINCE_DATE="${1#*=}"
+      shift
+      ;;
+    -h|--help)
+      show_help
+      exit 0
+      ;;
+    -*)
+      echo "Error: Unknown option: $1" >&2
+      echo "Try '$0 --help' for more information." >&2
+      exit 1
+      ;;
+    *)
+      # 位置引数はエラー（後方互換性なし）
+      echo "Error: Unexpected argument: $1" >&2
+      echo "Use --months-ago or --since option instead." >&2
+      echo "Try '$0 --help' for more information." >&2
+      exit 1
+      ;;
+  esac
+done
+
+# 優先順位に基づく処理
+# 1. --since オプション（最優先）
+# 2. --months-ago オプション
+# 3. STATS_GITHUB_SINCE_DATE 環境変数（最低優先度）
+
+if [ -n "$SINCE_DATE" ]; then
+  # --since が指定されている（最優先）
+  # 日付形式のバリデーション
+  if ! [[ "$SINCE_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+    echo "Error: --since must be in YYYY-MM-DD format" >&2
+    exit 1
+  fi
+  # 有効な日付かチェック（macOS/Linux両対応）
+  if date -j -f "%Y-%m-%d" "$SINCE_DATE" > /dev/null 2>&1; then
+    : # macOS: 日付が有効
+  elif date -d "$SINCE_DATE" > /dev/null 2>&1; then
+    : # Linux: 日付が有効
+  else
+    echo "Error: Invalid date: $SINCE_DATE" >&2
+    exit 1
+  fi
+elif [ -n "$MONTHS_AGO" ]; then
+  # --months-ago が指定されている
+  # 数値バリデーション
+  if ! [[ "$MONTHS_AGO" =~ ^[0-9]+$ ]]; then
+    echo "Error: --months-ago must be a positive integer" >&2
+    exit 1
+  fi
+  # SINCE_DATE を計算（macOS/Linux両対応）
+  if date -v -${MONTHS_AGO}m > /dev/null 2>&1; then
+    SINCE_DATE=$(date -v -${MONTHS_AGO}m +%Y-%m-%d)
+  else
+    SINCE_DATE=$(date -d "${MONTHS_AGO} months ago" +%Y-%m-%d)
+  fi
+elif [ -n "${STATS_GITHUB_SINCE_DATE}" ]; then
+  # 環境変数が設定されている（最低優先度、非推奨）
+  echo "Warning: STATS_GITHUB_SINCE_DATE environment variable is deprecated. Use --since option instead." >&2
+  SINCE_DATE="${STATS_GITHUB_SINCE_DATE}"
+else
+  # いずれも指定されていない
+  echo "Error: Either --months-ago or --since is required" >&2
+  echo "Try '$0 --help' for more information." >&2
+  exit 1
+fi
+
 # ==========================================
 # 【設定】デフォルト値（環境変数で上書き可能）
 # ==========================================
 REPOS="${REPOS}"
 LOCAL_ROOT="${REPOS_BASE_PATH}"
-MONTHS_AGO="${STATS_GITHUB_MONTHS_AGO:-12}"
 GIT_AUTHOR="${STATS_GITHUB_AUTHOR_PATTERN}"
 EXCLUDE_PATTERN="${REPO_AUTHORS_EXCLUDE_PATTERN}"
 MAX_LINES_LIMIT="${REPO_AUTHORS_MAX_LINES:-50000}"
 MASTER_REPOS="${STATS_GITHUB_MASTER_REPOS}"
 # ==========================================
-
-# SINCE_DATE が設定されていれば優先、なければ MONTHS_AGO から計算
-if [ -n "${STATS_GITHUB_SINCE_DATE}" ]; then
-    SINCE_DATE="${STATS_GITHUB_SINCE_DATE}"
-else
-    if date -v -${MONTHS_AGO}m > /dev/null 2>&1; then
-        # macOS
-        SINCE_DATE=$(date -v -${MONTHS_AGO}m +%Y-%m-%d)
-    else
-        # Linux
-        SINCE_DATE=$(date -d "${MONTHS_AGO} months ago" +%Y-%m-%d)
-    fi
-fi
 
 ALL_LOGS=$(mktemp)
 

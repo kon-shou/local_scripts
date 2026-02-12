@@ -1,22 +1,126 @@
 #!/bin/bash
 
+# ヘルプ関数
+show_help() {
+  cat << EOF
+Usage: $0 [OPTIONS]
+
+Show author contribution ranking for Git repositories.
+
+Options:
+  --months-ago=N        Show statistics for the last N months
+  --months-ago N        (alternative format)
+  --since=YYYY-MM-DD    Show statistics since the specified date
+  --since YYYY-MM-DD    (alternative format)
+  -h, --help            Show this help message
+
+Examples:
+  $0 --months-ago=12
+  $0 --since=2024-01-01
+
+Environment Variables:
+  REPOS                 List of repositories to analyze (required)
+  REPOS_BASE_PATH       Base directory for repositories (default: \$HOME)
+  STATS_GITHUB_MASTER_REPOS  Space-separated list of repos using 'master' branch
+  REPO_AUTHORS_EXCLUDE_PATTERN  Pattern to exclude from statistics
+  REPO_AUTHORS_MAX_LINES  Maximum lines threshold (default: 50000)
+
+Description:
+  This script analyzes Git repositories and shows author contribution
+  rankings based on changed lines. Large files and specified patterns
+  are automatically excluded.
+EOF
+}
+
+# デフォルト値
+MONTHS_AGO=""
+SINCE_DATE=""
+
+# オプション解析
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --months-ago)
+      MONTHS_AGO="$2"
+      shift 2
+      ;;
+    --months-ago=*)
+      MONTHS_AGO="${1#*=}"
+      shift
+      ;;
+    --since)
+      SINCE_DATE="$2"
+      shift 2
+      ;;
+    --since=*)
+      SINCE_DATE="${1#*=}"
+      shift
+      ;;
+    -h|--help)
+      show_help
+      exit 0
+      ;;
+    -*)
+      echo "Error: Unknown option: $1" >&2
+      echo "Try '$0 --help' for more information." >&2
+      exit 1
+      ;;
+    *)
+      # 位置引数はエラー（後方互換性なし）
+      echo "Error: Unexpected argument: $1" >&2
+      echo "Use --months-ago or --since option instead." >&2
+      echo "Try '$0 --help' for more information." >&2
+      exit 1
+      ;;
+  esac
+done
+
+# 必須チェック
+if [ -z "$MONTHS_AGO" ] && [ -z "$SINCE_DATE" ]; then
+  echo "Error: Either --months-ago or --since is required" >&2
+  echo "Try '$0 --help' for more information." >&2
+  exit 1
+fi
+
+# --since が指定された場合は優先
+if [ -n "$SINCE_DATE" ]; then
+  # 日付形式のバリデーション
+  if ! [[ "$SINCE_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+    echo "Error: --since must be in YYYY-MM-DD format" >&2
+    exit 1
+  fi
+  # 有効な日付かチェック（macOS/Linux両対応）
+  if date -j -f "%Y-%m-%d" "$SINCE_DATE" > /dev/null 2>&1; then
+    : # macOS: 日付が有効
+  elif date -d "$SINCE_DATE" > /dev/null 2>&1; then
+    : # Linux: 日付が有効
+  else
+    echo "Error: Invalid date: $SINCE_DATE" >&2
+    exit 1
+  fi
+elif [ -n "$MONTHS_AGO" ]; then
+  # 数値バリデーション
+  if ! [[ "$MONTHS_AGO" =~ ^[0-9]+$ ]]; then
+    echo "Error: --months-ago must be a positive integer" >&2
+    exit 1
+  fi
+  # SINCE_DATE を計算（macOS/Linux両対応）
+  if date -v -${MONTHS_AGO}m > /dev/null 2>&1; then
+    SINCE_DATE=$(date -v -${MONTHS_AGO}m +%Y-%m-%d)
+  else
+    SINCE_DATE=$(date -d "${MONTHS_AGO} months ago" +%Y-%m-%d)
+  fi
+fi
+
 # ==========================================
 # 【設定】デフォルト値（環境変数で上書き可能）
 # ==========================================
 LOCAL_ROOT="${REPOS_BASE_PATH:-$HOME}"
-MONTHS_AGO="${REPO_AUTHORS_MONTHS_AGO:-12}"
 MASTER_REPOS="${STATS_GITHUB_MASTER_REPOS}"
 EXCLUDE_PATTERN="${REPO_AUTHORS_EXCLUDE_PATTERN}"
 
 # 除外パターン & 行数制限
 MAX_LINES_LIMIT="${REPO_AUTHORS_MAX_LINES:-50000}"
 # ==========================================
-
-if date -v -${MONTHS_AGO}m > /dev/null 2>&1; then
-    SINCE_DATE=$(date -v -${MONTHS_AGO}m +%Y-%m-%d)
-else
-    SINCE_DATE=$(date -d "${MONTHS_AGO} months ago" +%Y-%m-%d)
-fi
 
 echo "📊 Author別 変更行数ランキング (${SINCE_DATE} 〜 本日)"
 echo "⚠️  除外条件: magicpod, lockファイル, 1ファイル${MAX_LINES_LIMIT}行以上"
