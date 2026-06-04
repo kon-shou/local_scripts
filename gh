@@ -1,0 +1,105 @@
+#!/bin/bash
+# gh ラッパー: GitHub API（特に GraphQL）の呼び出しをログに記録してから本物の gh に委譲する。
+# 目的: GraphQL レートリミットがすぐ枯渇する原因（どのシステムがいつ叩いているか）を特定する。
+#
+# 仕組み:
+#   - PATH 上で本物の gh (/opt/homebrew/bin/gh) より先に置かれている。
+#   - 呼ばれるたびに 時刻 / 呼び出し元プロセス系統 / 引数 / 前後のレート残量 をログに追記。
+#   - 本物の gh に exec せず、ラップして実行（後でレート消費量を測るため）。
+#
+# ログ: ~/.gh-graphql-audit.log（1行1呼び出しのTSV）
+# 無効化: このファイルを消すか、リネームする。
+
+REAL_GH="/opt/homebrew/bin/gh"
+LOG_FILE="${GH_AUDIT_LOG:-$HOME/.gh-graphql-audit.log}"
+
+# 本物の gh が無ければそのまま失敗（無限ループ防止のため絶対パスで判定）
+if [ ! -x "$REAL_GH" ]; then
+  echo "gh wrapper: real gh not found at $REAL_GH" >&2
+  exit 127
+fi
+
+# --- 呼び出し元プロセス系統を辿る（親→祖先を数段） ---
+# macOS の ps で ppid と comm を辿り、"zsh<node<claude" のような系統文字列を作る。
+build_proc_chain() {
+  local pid=$PPID
+  local chain=""
+  local depth=0
+  while [ "$pid" -gt 1 ] && [ "$depth" -lt 6 ]; do
+    # comm はコマンドの basename。args 全体だと長すぎるので comm を使う。
+    local line
+    line=$(ps -o ppid=,comm= -p "$pid" 2>/dev/null)
+    [ -z "$line" ] && break
+    local parent_pid
+    parent_pid=$(echo "$line" | awk '{print $1}')
+    local comm
+    comm=$(echo "$line" | awk '{$1=""; sub(/^ /,""); print}')
+    # パスを basename 化
+    comm=$(basename "$comm" 2>/dev/null)
+    if [ -z "$chain" ]; then
+      chain="${comm}(${pid})"
+    else
+      chain="${chain}<${comm}(${pid})"
+    fi
+    pid=$parent_pid
+    depth=$((depth + 1))
+  done
+  echo "$chain"
+}
+
+TS=$(date +%Y-%m-%dT%H:%M:%S%z)
+PROC_CHAIN=$(build_proc_chain)
+
+# 引数（タブや改行を潰して1行に収める）
+ARGS_JOINED=$(printf '%s ' "$@" | tr '\t\n' '  ')
+
+# GraphQL を使う呼び出しかの簡易判定（gh の多くは内部 GraphQL だが、明示的に分かるものをマーク）
+# - "api graphql" は確実に GraphQL
+# - pr/issue/repo/search 系の多くは内部 GraphQL
+KIND="other"
+case " $* " in
+  # 自身の計測用 rate_limit 呼び出しはログ対象外（ノイズ防止・無限計測防止）
+  *" api rate_limit "*) KIND="ratecheck" ;;
+  *" api graphql "*|*" api "*graphql*) KIND="graphql-explicit" ;;
+  *" pr "*|*" issue "*|*" repo "*|*" search "*|*" project "*) KIND="graphql-likely" ;;
+  *" api "*) KIND="rest-likely" ;;
+esac
+
+# 計測用 rate_limit 呼び出しはログもレート計測もせず素通し
+if [ "$KIND" = "ratecheck" ]; then
+  exec "$REAL_GH" "$@"
+fi
+
+# --- 呼び出し前のレート残量を取得（自身の gh 呼び出しでループしないよう REAL_GH を直接、かつ軽量に） ---
+# 注意: rate_limit 取得自体は REST(core) を1消費するだけで GraphQL は消費しない。
+# ただし毎回叩くとノイズになるので、graphql/likely の時だけ前後を測る。
+RATE_BEFORE=""
+RATE_AFTER=""
+measure_rate() {
+  "$REAL_GH" api rate_limit --jq '.resources.graphql.remaining' 2>/dev/null
+}
+
+if [ "$KIND" = "graphql-explicit" ] || [ "$KIND" = "graphql-likely" ]; then
+  RATE_BEFORE=$(measure_rate)
+fi
+
+# --- 本物の gh を実行 ---
+"$REAL_GH" "$@"
+EXIT_CODE=$?
+
+if [ "$KIND" = "graphql-explicit" ] || [ "$KIND" = "graphql-likely" ]; then
+  RATE_AFTER=$(measure_rate)
+fi
+
+# レート差分（消費量）。前後どちらか欠けたら空。
+RATE_DELTA=""
+if [ -n "$RATE_BEFORE" ] && [ -n "$RATE_AFTER" ]; then
+  RATE_DELTA=$((RATE_BEFORE - RATE_AFTER))
+fi
+
+# --- ログ追記（TSV: 時刻 / 種別 / 呼び出し元系統 / 終了コード / GraphQL残量(後) / 消費量 / 引数） ---
+printf '%s\t%s\t%s\texit=%s\tgql_remaining=%s\tgql_delta=%s\t%s\n' \
+  "$TS" "$KIND" "$PROC_CHAIN" "$EXIT_CODE" "${RATE_AFTER:-NA}" "${RATE_DELTA:-NA}" "$ARGS_JOINED" \
+  >> "$LOG_FILE" 2>/dev/null
+
+exit $EXIT_CODE

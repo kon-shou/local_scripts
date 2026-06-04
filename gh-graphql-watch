@@ -1,0 +1,81 @@
+#!/bin/bash
+# GitHub GraphQL レートの残量を一定間隔でサンプリングし、勝手に減るタイミングを記録する。
+# 目的: 自分が gh を叩いていない時間帯にも remaining が減るなら、別プロセスが GraphQL を叩いている。
+#
+# 使い方:
+#   gh-graphql-watch                 # 5秒間隔で無限に監視（Ctrl-C で停止）
+#   gh-graphql-watch -i 10           # 10秒間隔
+#   gh-graphql-watch -n 60           # 60回で終了
+#   gh-graphql-watch -i 10 -n 30     # 10秒間隔×30回（=5分）
+#   nohup gh-graphql-watch -i 10 >/dev/null 2>&1 &   # バックグラウンド常駐
+#
+# 出力: ~/.gh-graphql-watch.log（追記）。標準出力にも同じ行を表示。
+#   各行: 時刻  remaining=N  used=N  delta=N  reset_in=Ns
+#   delta は前回サンプルからの減少量（>0 なら誰かが叩いた）。
+#
+# 注意: 本物の gh を直接叩く（ラッパー経由だとログが汚れるため）。rate_limit 取得は
+#       REST(core) を消費するだけで GraphQL 枠は減らさない。
+
+REAL_GH="/opt/homebrew/bin/gh"
+LOG_FILE="${GH_WATCH_LOG:-$HOME/.gh-graphql-watch.log}"
+INTERVAL=5
+COUNT=0   # 0 = 無限
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -i|--interval) INTERVAL="$2"; shift 2 ;;
+    -n|--count)    COUNT="$2";    shift 2 ;;
+    -h|--help)
+      grep '^#' "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    *) echo "unknown option: $1" >&2; exit 2 ;;
+  esac
+done
+
+if [ ! -x "$REAL_GH" ]; then
+  echo "gh-graphql-watch: real gh not found at $REAL_GH" >&2
+  exit 127
+fi
+
+echo "gh-graphql-watch: interval=${INTERVAL}s count=$([ "$COUNT" -eq 0 ] && echo '∞' || echo "$COUNT") log=$LOG_FILE"
+echo "  remaining が自分の操作なしに減れば、別プロセスが GraphQL を叩いている。Ctrl-C で停止。"
+
+PREV_REMAINING=""
+i=0
+while :; do
+  i=$((i + 1))
+
+  # graphql の残量・使用量・リセット時刻をまとめて1回で取得
+  JSON=$("$REAL_GH" api rate_limit --jq '.resources.graphql | "\(.remaining) \(.used) \(.reset)"' 2>/dev/null)
+  REMAINING=$(echo "$JSON" | awk '{print $1}')
+  USED=$(echo "$JSON" | awk '{print $2}')
+  RESET=$(echo "$JSON" | awk '{print $3}')
+
+  # 取得失敗時はそのまま記録して次へ
+  if [ -z "$REMAINING" ]; then
+    printf '%s\tERROR\t(rate_limit 取得失敗)\n' "$(date +%H:%M:%S)" | tee -a "$LOG_FILE"
+  else
+    # 前回からの減少量
+    DELTA=""
+    if [ -n "$PREV_REMAINING" ]; then
+      DELTA=$((PREV_REMAINING - REMAINING))
+    fi
+    # リセットまでの残り秒
+    NOW=$(date +%s)
+    RESET_IN=""
+    [ -n "$RESET" ] && RESET_IN=$((RESET - NOW))
+
+    printf '%s\tremaining=%s\tused=%s\tdelta=%s\treset_in=%ss\n' \
+      "$(date +%H:%M:%S)" "$REMAINING" "$USED" "${DELTA:-NA}" "${RESET_IN:-NA}" \
+      | tee -a "$LOG_FILE"
+
+    PREV_REMAINING="$REMAINING"
+  fi
+
+  # 回数指定があり、到達したら終了
+  if [ "$COUNT" -ne 0 ] && [ "$i" -ge "$COUNT" ]; then
+    break
+  fi
+
+  sleep "$INTERVAL"
+done
