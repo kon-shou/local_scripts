@@ -56,14 +56,20 @@ echo " (Feature: [ME] label for your own comments)"
 echo "========================================================"
 
 # 3. GraphQLクエリ
-QUERY="
-  query {
+# --paginate は1クエリにつきトップレベル1接続しかページングできないため、
+# timelineItems 用と reviewThreads 用にクエリを2本に分割する。
+# 各接続に pageInfo{hasNextPage endCursor} と $endCursor 変数を持たせると、
+# gh が自動でカーソルを送り全ページを取得する（出力はページごとのJSONが連結される）。
+
+QUERY_TIMELINE="
+  query(\$endCursor: String) {
     viewer {
       login
     }
     repository(owner: \"$OWNER\", name: \"$REPO\") {
       pullRequest(number: $PR_NUM) {
-        timelineItems(first: 100, itemTypes: [ISSUE_COMMENT, PULL_REQUEST_REVIEW]) {
+        timelineItems(first: 100, after: \$endCursor, itemTypes: [ISSUE_COMMENT, PULL_REQUEST_REVIEW]) {
+          pageInfo { hasNextPage endCursor }
           nodes {
             __typename
             ... on IssueComment { id createdAt author { login __typename } body url }
@@ -83,7 +89,17 @@ QUERY="
             }
           }
         }
-        reviewThreads(first: 100) {
+      }
+    }
+  }
+"
+
+QUERY_THREADS="
+  query(\$endCursor: String) {
+    repository(owner: \"$OWNER\", name: \"$REPO\") {
+      pullRequest(number: $PR_NUM) {
+        reviewThreads(first: 100, after: \$endCursor) {
+          pageInfo { hasNextPage endCursor }
           nodes {
             comments(first: 50) {
               nodes {
@@ -105,9 +121,29 @@ QUERY="
   }
 "
 
-# 4. 実行と整形
-gh api graphql -f query="$QUERY" | jq -r --arg filter_date "$FILTER_DATE_ISO" '
-  (if type == "array" then .[0] else . end) as $root |
+# 4. 実行（--paginate で全ページ取得）と整形
+# --paginate の出力はページごとのJSONオブジェクトが連結された形式。
+# --slurpfile で各ページを配列として読み込み（コメント本文に含まれる制御文字も
+# プロセス置換+ファイル経由なら正しく扱える）、全ページの nodes を flatten して
+# 単一の $root オブジェクトに合成する。
+jq -n -r --arg filter_date "$FILTER_DATE_ISO" \
+  --slurpfile timeline_pages <(gh api graphql --paginate -f query="$QUERY_TIMELINE") \
+  --slurpfile threads_pages <(gh api graphql --paginate -f query="$QUERY_THREADS") '
+  {
+    data: {
+      viewer: ($timeline_pages[0].data.viewer // {}),
+      repository: {
+        pullRequest: {
+          timelineItems: {
+            nodes: ([$timeline_pages[].data.repository.pullRequest.timelineItems.nodes[]?])
+          },
+          reviewThreads: {
+            nodes: ([$threads_pages[].data.repository.pullRequest.reviewThreads.nodes[]?])
+          }
+        }
+      }
+    }
+  } as $root |
 
   # 自分のユーザー名
   ($root.data.viewer.login // "") as $viewer_login |
