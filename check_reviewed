@@ -121,6 +121,30 @@ QUERY_THREADS="
   }
 "
 
+# Pending（下書き/未送信）レビュー。
+# PENDING レビューは認証ユーザー本人にしか見えないため、全コメントが自分(viewer)のもの。
+# reviewThreads / timelineItems には現れないので別クエリで取得する。
+# 1レビュー・少数コメントなので --paginate は不要（単発呼び出しで十分）。
+QUERY_PENDING="
+  query {
+    repository(owner: \"$OWNER\", name: \"$REPO\") {
+      pullRequest(number: $PR_NUM) {
+        reviews(first: 100, states: [PENDING]) {
+          nodes {
+            id
+            createdAt
+            comments(first: 100) {
+              nodes {
+                id createdAt author { login __typename } body path line url diffHunk
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+"
+
 # 4. 実行（--paginate で全ページ取得）と整形
 # --paginate の出力はページごとのJSONオブジェクトが連結された形式。
 # --slurpfile で各ページを配列として読み込み（コメント本文に含まれる制御文字も
@@ -128,7 +152,8 @@ QUERY_THREADS="
 # 単一の $root オブジェクトに合成する。
 jq -n -r --arg filter_date "$FILTER_DATE_ISO" \
   --slurpfile timeline_pages <(gh api graphql --paginate -f query="$QUERY_TIMELINE") \
-  --slurpfile threads_pages <(gh api graphql --paginate -f query="$QUERY_THREADS") '
+  --slurpfile threads_pages <(gh api graphql --paginate -f query="$QUERY_THREADS") \
+  --slurpfile pending_pages <(gh api graphql -f query="$QUERY_PENDING") '
   {
     data: {
       viewer: ($timeline_pages[0].data.viewer // {}),
@@ -139,6 +164,9 @@ jq -n -r --arg filter_date "$FILTER_DATE_ISO" \
           },
           reviewThreads: {
             nodes: ([$threads_pages[].data.repository.pullRequest.reviewThreads.nodes[]?])
+          },
+          pendingReviews: {
+            nodes: ([$pending_pages[].data.repository.pullRequest.reviews.nodes[]?])
           }
         }
       }
@@ -162,6 +190,7 @@ jq -n -r --arg filter_date "$FILTER_DATE_ISO" \
   def c_ctx:     "\u001b[90m";     # Dark Gray
   def c_orange:  "\u001b[38;5;208m"; # Orange (REPLIED/REACTED)
   def c_me:      "\u001b[1;34m";   # Bold Blue (ME) ★新規追加
+  def c_draft:   "[1;35m";   # Bold Magenta (DRAFT) ★新規追加
   def c_rst:     "\u001b[0m";
 
   def fmt_date(d): (d | split("T") | .[0] + " " + (.[1] | split("Z")[0] | sub("\\.\\d+$";"")));
@@ -266,6 +295,38 @@ jq -n -r --arg filter_date "$FILTER_DATE_ISO" \
     | flatten
   ) as $review_comments |
 
+  # 2.5. Pending（下書き）レビューのコメント。
+  #      PENDING レビューは viewer 本人のものなので is_mine/is_done は常に true。
+  #      parent_id を "NULL" にして各コメントを単独グループ化する
+  #      （pending review id はタイムラインに存在せず、孤立ヘッダーになるのを避けるため）。
+  ($root.data.repository.pullRequest.pendingReviews.nodes // []
+    | map(
+        .createdAt as $review_created |
+        (.comments.nodes // []) | map(
+          {
+            type: "CODE_COMMENT",
+            id: .id,
+            createdAt: (.createdAt // $review_created),
+            author: .author.login,
+            body: .body,
+            path: .path,
+            line: .line,
+            url: .url,
+            parent_id: "NULL",
+            diff_hunk: .diffHunk,
+            context: [],
+
+            is_replied: false,
+            is_reacted: false,
+            is_mine:    true,
+            is_done:    true,
+            is_draft:   true
+          }
+        )
+      )
+    | flatten
+  ) as $pending_comments |
+
   # 3. タイムライン
   ($root.data.repository.pullRequest.timelineItems.nodes // []
     | map(select(.author.__typename != "Bot" and .author.login != "github-actions"))
@@ -298,7 +359,7 @@ jq -n -r --arg filter_date "$FILTER_DATE_ISO" \
   # --- グルーピングと出力 ---
 
   # reviewThreadsとPullRequestReview.commentsのコメントをマージ（重複排除）
-  (($all_code_comments + $review_comments) | unique_by(.id)) as $merged_comments |
+  (($all_code_comments + $review_comments + $pending_comments) | unique_by(.id)) as $merged_comments |
 
   ($timeline_events + $merged_comments)
   | group_by(if .parent_id == "NULL" then .id else .parent_id end)
@@ -358,7 +419,8 @@ jq -n -r --arg filter_date "$FILTER_DATE_ISO" \
                 # --- Grayed Out (Done: ME / REPLIED / REACTED) ---
                 if .is_done then
                     (
-                      if .is_mine then "\(c_me)[ME]"
+                      if .is_draft then "\(c_draft)[ME][DRAFT]"
+                      elif .is_mine then "\(c_me)[ME]"
                       elif .is_replied and .is_reacted then "\(c_orange)[REPLIED] [REACTED]"
                       elif .is_replied then "\(c_orange)[REPLIED]"
                       else "\(c_orange)[REACTED]"
@@ -366,7 +428,7 @@ jq -n -r --arg filter_date "$FILTER_DATE_ISO" \
                     ) as $label_text |
 
                     "\n  \($label_text)\(c_rst)" +
-                    "\n  \(c_ctx)// [CODE] \(.path): \(.line // "outdated") (\(.url))\(c_rst)\n" +
+                    "\n  \(c_ctx)// [CODE] \(.path): \(.line // "outdated")\(if .url then " (\(.url))" else "" end)\(c_rst)\n" +
 
                     (if (.diff_hunk | length > 0) then
                        (.diff_hunk | split("\n") | map(
