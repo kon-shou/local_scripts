@@ -327,6 +327,13 @@ jq -n -r --arg filter_date "$FILTER_DATE_ISO" \
     | flatten
   ) as $pending_comments |
 
+  # draft コメントの id 集合。
+  # 注意: 既存スレッドへの返信を下書きすると、同じ id が reviewThreads 側にも現れる
+  # （publish 前でも返信スレッドの一部として取得される）。そのため $pending_comments を
+  # 単純にマージ配列へ足すと unique_by(.id) で published 版に負けて消える。
+  # 代わりに id 集合でフラグ付けし、どこにも属さない新規 draft だけ後から補完する。
+  ($pending_comments | map(.id)) as $draft_ids |
+
   # 3. タイムライン
   ($root.data.repository.pullRequest.timelineItems.nodes // []
     | map(select(.author.__typename != "Bot" and .author.login != "github-actions"))
@@ -359,7 +366,21 @@ jq -n -r --arg filter_date "$FILTER_DATE_ISO" \
   # --- グルーピングと出力 ---
 
   # reviewThreadsとPullRequestReview.commentsのコメントをマージ（重複排除）
-  (($all_code_comments + $review_comments + $pending_comments) | unique_by(.id)) as $merged_comments |
+  # 1) published 側で id が draft 集合にあるものへ is_draft フラグを立てる
+  #    （published 版の diffHunk/context/line を保ったまま draft マークを付与）。
+  #    draft は「対応中」なので is_done=false に上書きし、Active 表示へ回す。
+  # 2) どのスレッドにも属さない新規 draft（published 側に存在しない id）だけ補完追加。
+  ((($all_code_comments + $review_comments) | unique_by(.id)) | map(.id)) as $published_ids |
+  (
+    (($all_code_comments + $review_comments) | unique_by(.id)
+      | map(
+          if (.id as $i | $draft_ids | index($i)) then
+            . + { is_draft: true, is_done: false }
+          else .
+          end
+        ))
+    + ($pending_comments | map(select(.id as $i | $published_ids | index($i) | not)))
+  ) as $merged_comments |
 
   ($timeline_events + $merged_comments)
   | group_by(if .parent_id == "NULL" then .id else .parent_id end)
