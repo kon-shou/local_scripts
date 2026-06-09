@@ -417,10 +417,10 @@ jq -n -r --arg filter_date "$FILTER_DATE_ISO" \
                 . as $c |
 
                 # --- Grayed Out (Done: ME / REPLIED / REACTED) ---
-                if .is_done then
+                # draft は「対応中」扱いなので、is_done でもグレーアウトせず Active 側で表示する。
+                if (.is_done and (.is_draft | not)) then
                     (
-                      if .is_draft then "\(c_draft)[ME][DRAFT]"
-                      elif .is_mine then "\(c_me)[ME]"
+                      if .is_mine then "\(c_me)[ME]"
                       elif .is_replied and .is_reacted then "\(c_orange)[REPLIED] [REACTED]"
                       elif .is_replied then "\(c_orange)[REPLIED]"
                       else "\(c_orange)[REACTED]"
@@ -442,9 +442,10 @@ jq -n -r --arg filter_date "$FILTER_DATE_ISO" \
                      else "" end) +
                     indent(.body; "  \(c_ctx)//   :: ") + "\(c_rst)"
 
-                # --- Active (Review needed) ---
+                # --- Active (Review needed / draft) ---
                 else
-                    "\n  \(c_file)[CODE] \(.path):\(.line // "outdated")\(c_rst) \(c_ctx)(\(.url))\(c_rst)\n" +
+                    (if .is_draft then "\n  \(c_draft)[ME][DRAFT]\(c_rst)" else "" end) +
+                    "\n  \(c_file)[CODE] \(.path):\(.line // "outdated")\(c_rst)\(if .url then " \(c_ctx)(\(.url))\(c_rst)" else "" end)\n" +
                     (if (.diff_hunk | length > 0) then
                        (.diff_hunk | split("\n") | map(
                           if startswith("+") then "    \(c_ok)| \(.)\(c_rst)"
