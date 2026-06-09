@@ -170,13 +170,19 @@ jq -n -r --arg filter_date "$FILTER_DATE_ISO" \
   # --- データ処理 ---
 
   # 0. リプライ済みIDの特定
+  #    「そのコメントより後ろに、自分(viewer)が書いたコメントがあるか」で判定する。
+  #    他人A→他人B のように自分が関与しないやり取りはグレーアウトしない。
   ($root.data.repository.pullRequest.reviewThreads.nodes // []
     | map(.comments.nodes // [])
     | map(
-        if length > 1 then
-          .[0:-1] | map(.id)
-        else
+        . as $thread |
+        # スレッド内で viewer が書いた最後のコメントの位置
+        ( [ $thread | to_entries[] | select(.value.author.login == $viewer_login) | .key ] | max ) as $last_mine_idx |
+        if $last_mine_idx == null then
           []
+        else
+          # その位置より前のコメント = 「自分がリプライした対象」としてグレーアウト
+          $thread[0:$last_mine_idx] | map(.id)
         end
       )
     | flatten
